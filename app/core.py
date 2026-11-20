@@ -1,12 +1,15 @@
 """Your code. One stub per milestone; build them in order and keep each one small."""
+import copy
 import io
 import json
 import math
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.ao.quantization as tq
 from torch import nn
 from torch.nn import functional as F
 
@@ -698,8 +701,184 @@ def milestone_4(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PAT
 
 # --- Milestone 5: Apply dynamic and static post-training quantization to the model
 # Hint: Implement the quantization steps from 'Shrink a Neural Network with Quantisation' to reduce model precision.
-def milestone_5():  # TODO(milestone 5)
-    raise NotImplementedError("TODO(milestone 5)")
+
+DEFAULT_DYNAMIC_PATH = "data/model_dynamic.pt"
+DEFAULT_STATIC_PATH = "data/model_static.pt"
+DEFAULT_QUANTIZATION_PATH = "data/quantization.json"
+
+STATIC_LIMITATION = (
+    "PyTorch 2.15 no longer ships FX graph mode (prepare_fx/convert_fx were removed), and eager "
+    "mode cannot put softmax, matmul, LayerNorm or GELU on int8 because they have no quantized "
+    "kernels. So every nn.Linear is quantized on its own between QuantStub and DeQuantStub "
+    "(int8 weights and int8 activations, calibrated on training baskets); the attention math "
+    "around it stays float32. Quantizing the head also requires dequantizing its output."
+)
+
+
+def _count_quantized_linears(module: nn.Module, quantized_type) -> int:
+    return sum(isinstance(child, quantized_type) for child in module.modules())
+
+
+def quantize_dynamic_model(model: TinyCausalLM) -> dict:
+    """Dynamic post-training quantization: int8 weights for every ``nn.Linear``.
+
+    Linears are the only supported layer type in this tiny Transformer (embeddings,
+    LayerNorm and attention stay float32). The original model is copied, never changed.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            quantized = tq.quantize_dynamic(copy.deepcopy(model), {nn.Linear},
+                                           dtype=torch.qint8)
+        quantized.eval()
+        layers = _count_quantized_linears(quantized, torch.ao.nn.quantized.dynamic.Linear)
+        if layers == 0:
+            return {"method": "dynamic", "status": "failed", "model": None,
+                    "model_size_bytes": None, "quantized_layers": 0, "limitation": None,
+                    "error": "no nn.Linear layer was quantized"}
+        return {
+            "method": "dynamic",
+            "status": "ok",
+            "model": quantized,
+            "model_size_bytes": model_size_bytes(quantized),
+            "quantized_layers": layers,
+            "limitation": ("Only Linear weights are int8 (activations are quantized on the fly); "
+                           "embeddings, LayerNorm and the attention math remain float32."),
+            "error": None,
+        }
+    except Exception as error:                      # report honestly instead of pretending
+        return {"method": "dynamic", "status": "failed", "model": None,
+                "model_size_bytes": None, "quantized_layers": 0, "limitation": None,
+                "error": f"{type(error).__name__}: {error}"}
+
+
+class _StaticLinear(nn.Module):
+    """One ``nn.Linear`` quantized in eager mode between a QuantStub and a DeQuantStub.
+
+    Eager static quantization needs the activation range observed during calibration, so
+    the input is quantized, the int8 matmul runs, and the result is dequantized to float
+    for whatever float operation comes next.
+    """
+
+    def __init__(self, linear: nn.Linear, qconfig):
+        super().__init__()
+        self.quant = tq.QuantStub()
+        self.linear = linear
+        self.dequant = tq.DeQuantStub()
+        self.qconfig = qconfig
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dequant(self.linear(self.quant(x)))
+
+
+def _wrap_linears(module: nn.Module, qconfig) -> None:
+    """Replace every Linear child (recursively) with a quantizable wrapper."""
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            setattr(module, name, _StaticLinear(child, qconfig))
+        else:
+            _wrap_linears(child, qconfig)
+
+
+def quantize_static_model(model: TinyCausalLM, dataset: dict, n_calibration: int = 128,
+                          batch_size: int = 16) -> dict:
+    """Static post-training quantization with observers calibrated on training baskets.
+
+    Calibration only ever reads ``dataset["train"]``; the held-out eval baskets are used
+    later, for scoring, never for choosing the activation ranges.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            qconfig = tq.get_default_qconfig(torch.backends.quantized.engine)
+            prepared_model = copy.deepcopy(model).eval()
+            _wrap_linears(prepared_model, qconfig)
+            prepared = tq.prepare(prepared_model, inplace=False)
+            baskets = dataset["train"][:max(1, n_calibration)]
+            with torch.no_grad():                   # observers record the activation ranges
+                for start in range(0, len(baskets), batch_size):
+                    inputs, _ = _pad_batch(baskets[start:start + batch_size], PAD)
+                    prepared(inputs)
+            converted = tq.convert(prepared, inplace=False).eval()
+        quantized_linears = [child for child in converted.modules()
+                             if isinstance(child, torch.ao.nn.quantized.Linear)]
+        int8_weights = sum(1 for child in quantized_linears
+                           if child.weight().dtype == torch.qint8)
+        if not quantized_linears or int8_weights != len(quantized_linears):
+            return {"method": "static", "status": "failed", "model": None,
+                    "model_size_bytes": None, "quantized_layers": len(quantized_linears),
+                    "int8_weights": int8_weights, "calibrated_on": len(baskets),
+                    "limitation": STATIC_LIMITATION,
+                    "error": "conversion produced no int8 weights"}
+        return {
+            "method": "static",
+            "status": "ok",
+            "model": converted,
+            "model_size_bytes": model_size_bytes(converted),
+            "quantized_layers": len(quantized_linears),
+            "int8_weights": int8_weights,
+            "calibrated_on": len(baskets),
+            "limitation": STATIC_LIMITATION,
+            "error": None,
+        }
+    except Exception as error:
+        return {"method": "static", "status": "failed", "model": None,
+                "model_size_bytes": None, "quantized_layers": 0, "int8_weights": 0,
+                "calibrated_on": 0, "limitation": STATIC_LIMITATION,
+                "error": f"{type(error).__name__}: {error}"}
+
+
+def _json_safe(result: dict) -> dict:
+    """Drop the live module so a quantization result can be written as JSON."""
+    return {key: value for key, value in result.items() if key != "model"}
+
+
+def milestone_5(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PATH,
+                n_calibration: int = 128, max_eval: int | None = None,
+                out_dir: str = "data") -> dict:
+    """Apply dynamic and static post-training quantization and measure both.
+
+    Returns the baseline, the dynamic result and the static result. Each result carries
+    ``method``, ``status`` (``"ok"``/``"failed"``), the quantized ``model`` itself, its
+    measured ``model_size_bytes``, its metrics on the held-out baskets, and any
+    ``limitation``/``error``. JSON-safe copies are written to ``data/quantization.json``;
+    the quantized weights are saved next to the baseline checkpoint.
+    """
+    if dataset is None:
+        dataset = load_dataset() if Path(DEFAULT_DATASET_PATH).exists() else milestone_1()
+    if not Path(model_path).exists():
+        milestone_2(dataset=dataset, out_path=model_path)
+    model, _ = load_model(model_path)
+
+    baseline = {
+        "label": "float32 (baseline)",
+        "model_size_bytes": model_size_bytes(model),
+        "n_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "metrics": evaluate_model(model, dataset, max_examples=max_eval),
+    }
+    dynamic = quantize_dynamic_model(model)
+    static = quantize_static_model(model, dataset, n_calibration=n_calibration)
+
+    directory = Path(out_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    for result, filename in ((dynamic, DEFAULT_DYNAMIC_PATH), (static, DEFAULT_STATIC_PATH)):
+        if result["model"] is None:
+            result["metrics"], result["saved_path"] = None, None
+            continue
+        result["metrics"] = evaluate_model(result["model"], dataset, max_examples=max_eval)
+        result["saved_path"] = str(directory / Path(filename).name)
+        try:
+            torch.save(result["model"].state_dict(), result["saved_path"])
+        except Exception as error:
+            result["saved_path"] = None
+            result["save_error"] = f"{type(error).__name__}: {error}"
+
+    results = {"baseline": baseline, "dynamic": dynamic, "static": static}
+    summary = {"baseline": baseline, "dynamic": _json_safe(dynamic),
+               "static": _json_safe(static)}
+    path = directory / Path(DEFAULT_QUANTIZATION_PATH).name
+    path.write_text(json.dumps(summary, indent=2))
+    return results
 
 
 # --- Milestone 6: Demonstrate size reduction and evaluate accuracy impact

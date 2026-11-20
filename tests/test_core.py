@@ -297,9 +297,91 @@ def test_milestone_4_evaluates_held_out_data_deterministically(trained, dataset,
 
 
 # Milestone 5: Apply dynamic and static post-training quantization to the model
-@pytest.mark.skip(reason="remove this line when you start milestone 5")
-def test_milestone_5():
-    raise NotImplementedError("write the test for milestone 5")
+@pytest.fixture(scope="module")
+def quantized(tmp_path_factory, trained, dataset):
+    out_dir = tmp_path_factory.mktemp("quantized")
+    return core.milestone_5(dataset=dataset, model_path=trained["model_path"],
+                            n_calibration=32, max_eval=40, out_dir=str(out_dir))
+
+
+def test_milestone_5_dynamic_quantization_works(quantized, dataset):
+    import torch
+
+    dynamic = quantized["dynamic"]
+    assert dynamic["method"] == "dynamic"
+    assert dynamic["status"] == "ok" and dynamic["error"] is None
+    assert dynamic["quantized_layers"] == 9                  # 8 block Linears + the head
+    assert dynamic["model_size_bytes"] > 0
+    assert dynamic["model_size_bytes"] < quantized["baseline"]["model_size_bytes"]
+    assert dynamic["metrics"]["n_eval_used"] == 40
+    assert 0.0 <= dynamic["metrics"]["top1_accuracy"] <= 1.0
+
+    logits = dynamic["model"](torch.tensor([[core.BOS, 5, 9]]))
+    assert logits.shape == (1, 3, len(dataset["vocab"]))
+    assert torch.isfinite(logits).all()
+    assert any(isinstance(m, torch.ao.nn.quantized.dynamic.Linear)
+               for m in dynamic["model"].modules())
+
+
+def test_milestone_5_static_quantization_is_real_and_honest(quantized, dataset, trained,
+                                                            monkeypatch):
+    import torch
+
+    static = quantized["static"]
+    assert static["method"] == "static"
+    assert static["status"] == "ok" and static["error"] is None
+    assert static["quantized_layers"] == 9
+    assert static["int8_weights"] == 9
+    quantized_linears = [module for module in static["model"].modules()
+                         if isinstance(module, torch.ao.nn.quantized.Linear)]
+    assert len(quantized_linears) == 9
+    assert all(module.weight().dtype == torch.qint8 for module in quantized_linears)
+    assert static["model_size_bytes"] < quantized["baseline"]["model_size_bytes"]
+    assert static["calibrated_on"] == 32                    # training baskets only
+    assert "FX graph mode" in static["limitation"]
+    assert 0.0 <= static["metrics"]["top1_accuracy"] <= 1.0
+    logits = static["model"](torch.tensor([[core.BOS, 5, 9]]))
+    assert logits.shape == (1, 3, len(dataset["vocab"]))
+    assert torch.isfinite(logits).all()
+
+    # Calibration must not need (or touch) the held-out split.
+    model, _ = core.load_model(trained["model_path"])
+    train_only = core.quantize_static_model(model, {**dataset, "eval": []}, n_calibration=8)
+    assert train_only["status"] == "ok"
+    assert train_only["calibrated_on"] == 8
+
+    # A conversion failure must be reported as a failure, never as success.
+    def boom(*args, **kwargs):
+        raise RuntimeError("conversion unsupported")
+    monkeypatch.setattr(core.tq, "convert", boom)
+    failed = core.quantize_static_model(model, dataset, n_calibration=8)
+    assert failed["status"] == "failed"
+    assert failed["model"] is None
+    assert "conversion unsupported" in failed["error"]
+
+
+def test_milestone_5_original_model_is_untouched(trained, dataset):
+    import torch
+
+    model, _ = core.load_model(trained["model_path"])
+    before = core.evaluate_model(model, dataset, max_examples=20)
+    core.quantize_dynamic_model(model)
+    core.quantize_static_model(model, dataset, n_calibration=8)
+    after = core.evaluate_model(model, dataset, max_examples=20)
+    assert before == after
+    assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+
+
+def test_milestone_5_sizes_and_saved_artifacts(quantized):
+    import os
+
+    baseline_size = quantized["baseline"]["model_size_bytes"]
+    for name in ("dynamic", "static"):
+        result = quantized[name]
+        assert isinstance(result["model_size_bytes"], int)
+        assert 0 < result["model_size_bytes"] < baseline_size
+        assert os.path.getsize(result["saved_path"]) > 0
+    assert quantized["dynamic"]["model_size_bytes"] != quantized["static"]["model_size_bytes"]
 
 
 # Milestone 6: Demonstrate size reduction and evaluate accuracy impact
