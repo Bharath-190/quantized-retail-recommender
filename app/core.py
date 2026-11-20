@@ -1,8 +1,12 @@
 """Your code. One stub per milestone; build them in order and keep each one small."""
 import json
+import math
 from pathlib import Path
 
 import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
 
 # --- Milestone 1: Prepare synthetic shopping basket data for training
 # Hint: Use the data preparation techniques from 'Teach a Language Model What Sells Together' to format your shopping basket sequences.
@@ -200,3 +204,267 @@ def decode_sequence(dataset: dict, tokens: list[int]) -> list[str]:
     """The product names in a token sequence, with the ``<bos>``/``<eos>``/``<pad>`` dropped."""
     return [dataset["vocab"][int(token)] for token in tokens
             if int(token) >= len(SPECIAL_TOKENS)]
+
+
+# --- Milestone 2: Continue pretraining a small LM on the basket data
+# Hint: Apply the fine-tuning methods from 'Teach a Language Model What Sells Together' to adapt your model.
+
+DEFAULT_MODEL_PATH = "data/model.pt"
+
+# Deliberately tiny: ~79k parameters, a 64-wide residual stream and two blocks. That is
+# enough to learn 79 product tokens and still trains in seconds on a laptop CPU.
+DEFAULT_MODEL_CONFIG = {
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 2,
+    "d_ff": 128,
+    "dropout": 0.0,
+}
+
+
+def model_config(vocab_size: int, max_len: int = MAX_LEN, **overrides) -> dict:
+    """The full model configuration: vocabulary, context length and the tiny architecture."""
+    config = {
+        "vocab_size": vocab_size,
+        "max_len": max_len,
+        "pad_token_id": PAD,
+        "bos_token_id": BOS,
+        "eos_token_id": EOS,
+        **DEFAULT_MODEL_CONFIG,
+    }
+    config.update(overrides)
+    return config
+
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head self-attention written with plain Linear layers and plain matmuls.
+
+    Keeping the matrix multiplications explicit (instead of using a fused attention op)
+    keeps the model easy to read and easy to quantize in milestone 5.
+    """
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self.n_heads = config["n_heads"]
+        self.head_dim = config["d_model"] // self.n_heads
+        self.qkv = nn.Linear(config["d_model"], 3 * config["d_model"])
+        self.proj = nn.Linear(config["d_model"], config["d_model"])
+        self.dropout = nn.Dropout(config["dropout"])
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        batch, steps, width = x.shape
+        shape = (batch, steps, self.n_heads, self.head_dim)
+        query, key, value = self.qkv(x).split(width, dim=2)
+        query = query.view(shape).transpose(1, 2)   # (batch, heads, steps, head_dim)
+        key = key.view(shape).transpose(1, 2)
+        value = value.view(shape).transpose(1, 2)
+        scores = (query @ key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
+        weights = self.dropout(torch.softmax(scores, dim=-1))
+        out = (weights @ value).transpose(1, 2).reshape(batch, steps, width)
+        return self.proj(out)
+
+
+class Block(nn.Module):
+    """One pre-norm Transformer block: attention, then a small feed-forward network."""
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config["d_model"])
+        self.attention = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config["d_model"])
+        self.mlp = nn.Sequential(
+            nn.Linear(config["d_model"], config["d_ff"]),
+            nn.GELU(),
+            nn.Linear(config["d_ff"], config["d_model"]),
+        )
+        self.dropout = nn.Dropout(config["dropout"])
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = x + self.dropout(self.attention(self.ln_1(x), mask))
+        x = x + self.dropout(self.mlp(self.ln_2(x)))
+        return x
+
+
+class TinyCausalLM(nn.Module):
+    """A tiny decoder-only Transformer language model over product tokens.
+
+    ``forward(tokens)`` takes a ``(batch, steps)`` LongTensor of token ids and returns
+    ``(batch, steps, vocab_size)`` logits; position ``t`` predicts token ``t + 1``.
+    """
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self.config = dict(config)
+        self.token_embedding = nn.Embedding(config["vocab_size"], config["d_model"],
+                                            padding_idx=config["pad_token_id"])
+        self.position_embedding = nn.Embedding(config["max_len"], config["d_model"])
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config["n_layers"])])
+        self.ln_f = nn.LayerNorm(config["d_model"])
+        self.head = nn.Linear(config["d_model"], config["vocab_size"], bias=False)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def attention_mask(self, tokens: torch.Tensor) -> torch.Tensor:
+        """True where attention is forbidden: the future, and padded positions."""
+        steps = tokens.shape[1]
+        future = torch.triu(torch.ones(steps, steps, dtype=torch.bool, device=tokens.device),
+                            diagonal=1)
+        padding = tokens == self.config["pad_token_id"]
+        return padding[:, None, None, :] | future[None, None, :, :]
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        steps = tokens.shape[1]
+        positions = torch.arange(steps, device=tokens.device)
+        x = self.token_embedding(tokens) + self.position_embedding(positions)[None, :, :]
+        mask = self.attention_mask(tokens)
+        for block in self.blocks:
+            x = block(x, mask)
+        return self.head(self.ln_f(x))
+
+
+def create_model(config: dict) -> TinyCausalLM:
+    """Build the tiny model from its configuration dict (no weights loaded)."""
+    return TinyCausalLM(config)
+
+
+def _pad_batch(sequences: list[list[int]], pad_token_id: int):
+    """Stack ragged baskets into one batch: inputs are ``tokens[:-1]``, targets ``tokens[1:]``."""
+    width = max(len(sequence) for sequence in sequences)
+    tokens = torch.full((len(sequences), width), pad_token_id, dtype=torch.long)
+    for row, sequence in enumerate(sequences):
+        tokens[row, :len(sequence)] = torch.tensor(sequence, dtype=torch.long)
+    return tokens[:, :-1], tokens[:, 1:]
+
+
+def train_model(dataset: dict, config: dict | None = None, epochs: int = 20,
+                batch_size: int = 64, lr: float = 3e-3, seed: int = 0):
+    """Train the tiny LM with a plain next-token cross-entropy loop.
+
+    Returns ``(model, loss_history)`` with one mean training loss per epoch.
+    """
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    config = config or model_config(len(dataset["vocab"]), dataset["max_len"])
+    model = create_model(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    sequences = dataset["train"]
+    history = []
+    for _ in range(epochs):
+        model.train()
+        total, seen = 0.0, 0
+        order = rng.permutation(len(sequences))
+        for start in range(0, len(sequences), batch_size):
+            batch = [sequences[int(i)] for i in order[start:start + batch_size]]
+            inputs, targets = _pad_batch(batch, config["pad_token_id"])
+            logits = model(inputs)
+            loss = F.cross_entropy(logits.reshape(-1, config["vocab_size"]),
+                                   targets.reshape(-1),
+                                   ignore_index=config["pad_token_id"])
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total += float(loss.item()) * len(batch)
+            seen += len(batch)
+        history.append(total / max(1, seen))
+    model.eval()
+    return model, history
+
+
+def save_model(path: str, model: TinyCausalLM, dataset: dict, seed: int) -> str:
+    """Write weights plus the minimal metadata later milestones need (vocab + config)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "config": dict(model.config),
+        "vocab": dataset["vocab"],
+        "item2id": dataset["item2id"],
+        "seed": seed,
+        "state_dict": model.state_dict(),
+    }, path)
+    return str(path)
+
+
+def load_model(path: str = DEFAULT_MODEL_PATH) -> tuple[TinyCausalLM, dict]:
+    """Read back a saved checkpoint; the model is returned in eval mode."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    model = create_model(checkpoint["config"])
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    return model, checkpoint
+
+
+def milestone_2(dataset: dict | None = None, epochs: int = 20, batch_size: int = 64,
+                lr: float = 3e-3, seed: int = 0,
+                out_path: str | None = DEFAULT_MODEL_PATH) -> dict:
+    """Train the tiny causal LM on the milestone 1 basket sequences.
+
+    The objective is ordinary next-token prediction, so the model is a real language
+    model over the product vocabulary. The checkpoint (weights, vocabulary and model
+    config) is written to ``out_path`` and the returned dict is JSON-safe metadata::
+
+        {
+          "model_path": "data/model.pt",
+          "config": {"vocab_size": 79, "d_model": 64, ...},
+          "vocab": ["<pad>", "<bos>", "<eos>", product, ...],
+          "item2id": {product: token id},
+          "seed": 0, "epochs": 20, "n_train": 2250, "n_params": 78592,
+          "loss_history": [...one mean training loss per epoch...],
+          "final_loss": 1.234,
+        }
+    """
+    if dataset is None:
+        data_path = Path(DEFAULT_DATASET_PATH)
+        dataset = load_dataset() if data_path.exists() else milestone_1()
+    model, history = train_model(dataset, epochs=epochs, batch_size=batch_size,
+                                 lr=lr, seed=seed)
+    if out_path:
+        save_model(out_path, model, dataset, seed)
+    return {
+        "model_path": str(out_path) if out_path else None,
+        "config": dict(model.config),
+        "vocab": dataset["vocab"],
+        "item2id": dataset["item2id"],
+        "seed": seed,
+        "epochs": epochs,
+        "n_train": len(dataset["train"]),
+        "n_params": sum(parameter.numel() for parameter in model.parameters()),
+        "loss_history": [float(value) for value in history],
+        "final_loss": float(history[-1]),
+    }
+
+
+# --- Milestone 3: Implement next-item prediction and itemset probing
+# Hint: Use the inference and analysis patterns from 'Teach a Language Model What Sells Together' to generate recommendations.
+def milestone_3():  # TODO(milestone 3)
+    raise NotImplementedError("TODO(milestone 3)")
+
+
+# --- Milestone 4: Measure the baseline size and accuracy of the model
+# Hint: Before quantization, record the model's original size and evaluate its performance metrics.
+def milestone_4():  # TODO(milestone 4)
+    raise NotImplementedError("TODO(milestone 4)")
+
+
+# --- Milestone 5: Apply dynamic and static post-training quantization to the model
+# Hint: Implement the quantization steps from 'Shrink a Neural Network with Quantisation' to reduce model precision.
+def milestone_5():  # TODO(milestone 5)
+    raise NotImplementedError("TODO(milestone 5)")
+
+
+# --- Milestone 6: Demonstrate size reduction and evaluate accuracy impact
+# Hint: Compare the size of the quantized model to the original and re-evaluate its accuracy using techniques from 'Shrink a Neural Network with Quantisation'.
+def milestone_6():  # TODO(milestone 6)
+    raise NotImplementedError("TODO(milestone 6)")

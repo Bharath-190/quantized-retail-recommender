@@ -81,9 +81,76 @@ def test_milestone_1_has_co_purchase_patterns(dataset):
 
 
 # Milestone 2: Continue pretraining a small LM on the basket data
-@pytest.mark.skip(reason="remove this line when you start milestone 2")
-def test_milestone_2():
-    raise NotImplementedError("write the test for milestone 2")
+@pytest.fixture(scope="module")
+def trained(tmp_path_factory, dataset):
+    path = tmp_path_factory.mktemp("model") / "model.pt"
+    return core.milestone_2(dataset=dataset, epochs=8, batch_size=64, lr=5e-3,
+                            seed=0, out_path=str(path))
+
+
+def test_milestone_2_creates_a_small_causal_model(dataset):
+    import torch
+
+    config = core.model_config(len(dataset["vocab"]), dataset["max_len"])
+    model = core.create_model(config)
+    assert isinstance(model, torch.nn.Module)
+    assert 10_000 < sum(p.numel() for p in model.parameters()) < 1_000_000
+
+    tokens = torch.tensor([[core.BOS, 5, 9, core.EOS], [core.BOS, 12, core.EOS, core.PAD]])
+    logits = model(tokens)
+    assert logits.shape == (2, 4, len(dataset["vocab"]))
+    assert torch.isfinite(logits).all()                 # padded positions must not produce NaNs
+
+
+def test_milestone_2_trains_and_saves(trained):
+    import torch
+
+    assert trained["n_train"] == 540
+    assert len(trained["loss_history"]) == trained["epochs"] == 8
+    assert all(torch.isfinite(torch.tensor(trained["loss_history"])))
+    assert trained["final_loss"] < trained["loss_history"][0]   # it actually learned something
+
+    model, checkpoint = core.load_model(trained["model_path"])
+    assert model.training is False
+    assert checkpoint["config"] == trained["config"]
+    assert checkpoint["vocab"] == trained["vocab"]
+    assert checkpoint["item2id"] == trained["item2id"]
+    assert sum(p.numel() for p in model.parameters()) == trained["n_params"]
+
+    logits = model(torch.tensor([[core.BOS, 5, 9]]))
+    assert logits.shape == (1, 3, len(trained["vocab"]))
+    assert torch.isfinite(logits).all()
+    predicted = int(logits[0, -1].argmax())
+    assert 0 <= predicted < len(trained["vocab"])        # a valid next-token prediction
+
+
+def test_milestone_2_is_causal(trained):
+    import torch
+
+    model, _ = core.load_model(trained["model_path"])
+    prefix = [core.BOS, 4, 7]
+    first = model(torch.tensor([prefix + [11]]))[0]
+    second = model(torch.tensor([prefix + [23]]))[0]
+    assert torch.allclose(first[:3], second[:3])         # the future cannot change the past
+    assert not torch.allclose(first[3], second[3])
+
+
+def test_milestone_2_is_reproducible(dataset):
+    import torch
+
+    first = core.milestone_2(dataset=dataset, epochs=2, batch_size=64, lr=5e-3,
+                             seed=11, out_path=None)
+    second = core.milestone_2(dataset=dataset, epochs=2, batch_size=64, lr=5e-3,
+                              seed=11, out_path=None)
+    other = core.milestone_2(dataset=dataset, epochs=2, batch_size=64, lr=5e-3,
+                             seed=12, out_path=None)
+    assert first["loss_history"] == pytest.approx(second["loss_history"], abs=1e-6)
+    assert first["loss_history"] != pytest.approx(other["loss_history"], abs=1e-6)
+
+    model_a, _ = core.train_model(dataset, epochs=2, batch_size=64, lr=5e-3, seed=11)
+    model_b, _ = core.train_model(dataset, epochs=2, batch_size=64, lr=5e-3, seed=11)
+    for left, right in zip(model_a.state_dict().values(), model_b.state_dict().values()):
+        assert torch.allclose(left, right, atol=1e-8)
 
 
 # Milestone 3: Implement next-item prediction and itemset probing
