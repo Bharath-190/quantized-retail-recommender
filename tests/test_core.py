@@ -154,9 +154,90 @@ def test_milestone_2_is_reproducible(dataset):
 
 
 # Milestone 3: Implement next-item prediction and itemset probing
-@pytest.mark.skip(reason="remove this line when you start milestone 3")
-def test_milestone_3():
-    raise NotImplementedError("write the test for milestone 3")
+@pytest.fixture(scope="module")
+def recommender(trained):
+    model, checkpoint = core.load_model(trained["model_path"])
+    return model, checkpoint
+
+
+def test_milestone_3_recommends_ranked_valid_products(recommender):
+    model, checkpoint = recommender
+    dataset = {"vocab": checkpoint["vocab"], "item2id": checkpoint["item2id"],
+               "max_len": checkpoint["config"]["max_len"]}
+    basket = ["Milk 1L", "Breakfast Cereal"]
+    recommendations = core.recommend(model, dataset, basket, k=5)
+
+    assert len(recommendations) == 5
+    probabilities = [item["probability"] for item in recommendations]
+    assert probabilities == sorted(probabilities, reverse=True)   # ranked, best first
+    assert all(0.0 < probability <= 1.0 for probability in probabilities)
+    assert all(item["product"] in dataset["item2id"] for item in recommendations)
+    assert not {item["product"] for item in recommendations} & set(basket)
+
+
+def test_milestone_3_excludes_products_already_in_the_basket(recommender):
+    model, checkpoint = recommender
+    dataset = {"vocab": checkpoint["vocab"], "item2id": checkpoint["item2id"],
+               "max_len": checkpoint["config"]["max_len"]}
+    basket = list(dataset["item2id"])[:10] + ["Milk 1L"]        # includes a duplicate
+    recommendations = core.recommend(model, dataset, basket, k=5)
+    assert len(recommendations) == 5
+    assert not {item["product"] for item in recommendations} & set(basket)
+
+    everything = core.recommend(model, dataset, list(dataset["item2id"]), k=10)
+    assert everything == []                                      # nothing left to suggest
+
+
+def test_milestone_3_handles_empty_unknown_and_long_baskets(recommender):
+    model, checkpoint = recommender
+    dataset = {"vocab": checkpoint["vocab"], "item2id": checkpoint["item2id"],
+               "max_len": checkpoint["config"]["max_len"]}
+
+    empty = core.recommend(model, dataset, [], k=3)              # <bos> only
+    assert len(empty) == 3
+    assert all(item["product"] in dataset["item2id"] for item in empty)
+
+    with pytest.raises(ValueError):
+        core.recommend(model, dataset, ["Unicorn Steak"], k=3)
+    with pytest.raises(ValueError):
+        core.recommend(model, dataset, ["Milk 1L", "Nope"], k=3)
+
+    long_basket = list(dataset["item2id"])[:20]                  # longer than the context
+    assert len(core.recommend(model, dataset, long_basket, k=2)) == 2
+    with pytest.raises(ValueError):
+        core.recommend(model, dataset, ["Milk 1L"], k=0)
+
+
+def test_milestone_3_probes_itemsets(recommender, dataset):
+    model, _ = recommender
+    pair = ["Laundry Detergent", "Fabric Softener"]
+    result = core.probe_itemset(model, dataset, pair, k=3)
+    assert result["items"] == pair
+    assert len(result["ranks"]) == 2
+    assert all(1 <= rank <= len(dataset["item2id"]) for rank in result["ranks"])
+    assert 0.0 <= result["hit@k"] <= 1.0
+
+    summary = core.probe_itemsets(model, dataset, k=3)
+    assert summary["n_itemsets"] == len(dataset["themes"]) == 10
+    assert len(summary["per_itemset"]) == 10
+    assert 0.0 <= summary["hit@k"] <= 1.0
+    assert summary["mean_rank"] < len(dataset["item2id"]) / 2   # better than chance
+
+    with pytest.raises(ValueError):
+        core.probe_itemset(model, dataset, ["Milk 1L"], k=3)
+    with pytest.raises(ValueError):
+        core.probe_itemset(model, dataset, ["Milk 1L", "Nope"], k=3)
+
+
+def test_milestone_3_is_deterministic(trained, dataset):
+    first = core.milestone_3(basket=["Pasta"], k=4, model_path=trained["model_path"],
+                             dataset=dataset)
+    second = core.milestone_3(basket=["Pasta"], k=4, model_path=trained["model_path"],
+                              dataset=dataset)
+    assert first == second                                           # eval mode, no sampling
+    assert first["basket"] == ["Pasta"]
+    assert len(first["recommendations"]) == 4
+    assert first["probing"]["n_itemsets"] == 10
 
 
 # Milestone 4: Measure the baseline size and accuracy of the model

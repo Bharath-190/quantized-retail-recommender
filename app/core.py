@@ -448,8 +448,124 @@ def milestone_2(dataset: dict | None = None, epochs: int = 20, batch_size: int =
 
 # --- Milestone 3: Implement next-item prediction and itemset probing
 # Hint: Use the inference and analysis patterns from 'Teach a Language Model What Sells Together' to generate recommendations.
-def milestone_3():  # TODO(milestone 3)
-    raise NotImplementedError("TODO(milestone 3)")
+
+PRODUCT_OFFSET = len(SPECIAL_TOKENS)   # token id of the first real product
+
+
+def _basket_tokens(dataset: dict, basket: list[str]) -> list[int]:
+    """Validate a basket of product names and turn it into model input tokens.
+
+    Duplicates are ignored and a basket longer than the model's context keeps only its
+    most recent items. An empty basket is allowed: it is just the ``<bos>`` token.
+    """
+    item2id = dataset["item2id"]
+    unknown = [name for name in basket if name not in item2id]
+    if unknown:
+        raise ValueError(f"unknown product(s): {unknown}. "
+                         f"Pick names from the catalogue, e.g. {list(item2id)[:3]}")
+    ids = list(dict.fromkeys(item2id[name] for name in basket))
+    return [BOS] + ids[-(dataset["max_len"] - 2):]
+
+
+def next_item_probabilities(model: TinyCausalLM, dataset: dict,
+                            basket: list[str]) -> torch.Tensor:
+    """P(next product | basket) for every token, straight from the language model."""
+    tokens = _basket_tokens(dataset, basket)
+    with torch.no_grad():
+        logits = model(torch.tensor([tokens]))[0, -1]
+    return torch.softmax(logits, dim=-1)
+
+
+def recommend(model: TinyCausalLM, dataset: dict, basket: list[str],
+              k: int = 5) -> list[dict]:
+    """Rank the products the model thinks come next, skipping what is already in the basket.
+
+    Returns ``[{"product": name, "probability": p}, ...]`` sorted by probability.
+    """
+    if k < 1:
+        raise ValueError("k must be at least 1")
+    probabilities = next_item_probabilities(model, dataset, basket)
+    vocab, item2id = dataset["vocab"], dataset["item2id"]
+    seen = {item2id[name] for name in basket if name in item2id}
+    ranked = [(vocab[token], float(probabilities[token]))
+              for token in range(PRODUCT_OFFSET, len(vocab)) if token not in seen]
+    ranked.sort(key=lambda pair: pair[1], reverse=True)
+    return [{"product": name, "probability": probability} for name, probability in ranked[:k]]
+
+
+def probe_itemset(model: TinyCausalLM, dataset: dict, items: list[str], k: int = 3) -> dict:
+    """Itemset probing: hide one item of a known combination and rank it from the rest.
+
+    This asks the itemset question - do these products go together? - of the model rather
+    than of a counter. For every item in turn the others are shown as the basket and the
+    hidden item's rank among all products (1 is best) is recorded. Nothing is sampled,
+    so the probe is deterministic.
+    """
+    if len(items) < 2:
+        raise ValueError("probe a combination of at least two products")
+    _basket_tokens(dataset, items)                      # validates the product names
+    vocab, item2id = dataset["vocab"], dataset["item2id"]
+    ranks, probabilities = [], []
+    for hidden in dict.fromkeys(items):
+        visible = [name for name in items if name != hidden]
+        scores = next_item_probabilities(model, dataset, visible)
+        target = item2id[hidden]
+        seen = {item2id[name] for name in visible}
+        better = sum(1 for token in range(PRODUCT_OFFSET, len(vocab))
+                     if token not in seen and token != target
+                     and float(scores[token]) >= float(scores[target]))
+        ranks.append(1 + better)
+        probabilities.append(float(scores[target]))
+    return {
+        "items": list(items),
+        "ranks": ranks,                                  # one rank per item, same order
+        "hit@k": sum(rank <= k for rank in ranks) / len(ranks),
+        "mean_rank": sum(ranks) / len(ranks),
+        "mean_probability": sum(probabilities) / len(probabilities),
+    }
+
+
+def probe_itemsets(model: TinyCausalLM, dataset: dict, k: int = 3,
+                   themes: list[list[str]] | None = None) -> dict:
+    """Probe every planted co-purchase pair (and optionally other combinations)."""
+    themes = dataset["themes"] if themes is None else themes
+    per_itemset = [probe_itemset(model, dataset, list(theme[:2]), k=k) for theme in themes]
+    return {
+        "k": k,
+        "n_itemsets": len(per_itemset),
+        "hit@k": sum(result["hit@k"] for result in per_itemset) / len(per_itemset),
+        "mean_rank": sum(result["mean_rank"] for result in per_itemset) / len(per_itemset),
+        "per_itemset": [{"items": result["items"], "ranks": result["ranks"],
+                         "hit@k": result["hit@k"]} for result in per_itemset],
+    }
+
+
+def milestone_3(basket: list[str] | None = None, k: int = 5,
+                model_path: str = DEFAULT_MODEL_PATH, dataset: dict | None = None,
+                probe_k: int = 3) -> dict:
+    """Recommend the next products for a basket and probe the planted combinations.
+
+    The recommendations are the model's own next-token distribution, so they change when
+    the basket changes. Returns JSON-safe results::
+
+        {
+          "basket": [product, ...],
+          "recommendations": [{"product": name, "probability": 0.12}, ...],
+          "probing": {"k": 3, "n_itemsets": 10, "hit@k": 0.6,
+                      "mean_rank": 4.2, "per_itemset": [...]},
+        }
+    """
+    if dataset is None:
+        dataset = load_dataset() if Path(DEFAULT_DATASET_PATH).exists() else milestone_1()
+    if not Path(model_path).exists():
+        milestone_2(dataset=dataset, out_path=model_path)
+    model, _ = load_model(model_path)
+    basket = list(basket) if basket is not None else ["Milk 1L", "Breakfast Cereal"]
+    return {
+        "basket": basket,
+        "recommendations": recommend(model, dataset, basket, k=k),
+        "probing": probe_itemsets(model, dataset, k=probe_k),
+    }
 
 
 # --- Milestone 4: Measure the baseline size and accuracy of the model
