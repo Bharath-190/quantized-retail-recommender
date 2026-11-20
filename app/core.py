@@ -1,4 +1,11 @@
-"""Your code. One stub per milestone; build them in order and keep each one small."""
+"""The six milestones of the Quantized Retail Recommender.
+
+1. synthetic baskets + vocabulary, 2. tiny causal Transformer trained on them,
+3. next-item recommendations + itemset probing, 4. baseline size/accuracy/latency,
+5. dynamic and static post-training quantization, 6. measured comparison.
+
+Data artifacts default to ``<project root>/data`` so the app works from any directory.
+"""
 import copy
 import io
 import json
@@ -21,7 +28,10 @@ from torch.nn import functional as F
 PAD, BOS, EOS = 0, 1, 2
 SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>"]
 
-DEFAULT_DATASET_PATH = "data/dataset.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
+DEFAULT_DATA_DIR = str(DATA_DIR)
+DEFAULT_DATASET_PATH = str(DATA_DIR / "dataset.json")
 
 # A small shop: 76 products over five departments. Names are unique, so a product name
 # is already a perfectly good token and the mapping stays a plain dict.
@@ -214,7 +224,7 @@ def decode_sequence(dataset: dict, tokens: list[int]) -> list[str]:
 # --- Milestone 2: Continue pretraining a small LM on the basket data
 # Hint: Apply the fine-tuning methods from 'Teach a Language Model What Sells Together' to adapt your model.
 
-DEFAULT_MODEL_PATH = "data/model.pt"
+DEFAULT_MODEL_PATH = str(DATA_DIR / "model.pt")
 
 # Deliberately tiny: ~79k parameters, a 64-wide residual stream and two blocks. That is
 # enough to learn 79 product tokens and still trains in seconds on a laptop CPU.
@@ -421,15 +431,16 @@ def milestone_2(dataset: dict | None = None, epochs: int = 20, batch_size: int =
     config) is written to ``out_path`` and the returned dict is JSON-safe metadata::
 
         {
-          "model_path": "data/model.pt",
-          "config": {"vocab_size": 79, "d_model": 64, ...},
+          "model_path": ..., "config": {"vocab_size": ..., "d_model": ...},
           "vocab": ["<pad>", "<bos>", "<eos>", product, ...],
           "item2id": {product: token id},
-          "seed": 0, "epochs": 20, "n_train": 2250, "n_params": 78592,
+          "seed": ..., "epochs": ..., "n_train": ..., "n_params": ...,
           "loss_history": [...one mean training loss per epoch...],
-          "final_loss": 1.234,
+          "final_loss": ...,
         }
     """
+    if epochs < 1:
+        raise ValueError("epochs must be at least 1")
     if dataset is None:
         data_path = Path(DEFAULT_DATASET_PATH)
         dataset = load_dataset() if data_path.exists() else milestone_1()
@@ -534,6 +545,8 @@ def probe_itemsets(model: TinyCausalLM, dataset: dict, k: int = 3,
                    themes: list[list[str]] | None = None) -> dict:
     """Probe every planted co-purchase pair (and optionally other combinations)."""
     themes = dataset["themes"] if themes is None else themes
+    if not themes:
+        raise ValueError("no itemsets to probe")
     per_itemset = [probe_itemset(model, dataset, list(theme[:2]), k=k) for theme in themes]
     return {
         "k": k,
@@ -576,7 +589,7 @@ def milestone_3(basket: list[str] | None = None, k: int = 5,
 # --- Milestone 4: Measure the baseline size and accuracy of the model
 # Hint: Before quantization, record the model's original size and evaluate its performance metrics.
 
-DEFAULT_BASELINE_PATH = "data/baseline.json"
+DEFAULT_BASELINE_PATH = str(DATA_DIR / "baseline.json")
 
 
 def model_size_bytes(model: nn.Module) -> int:
@@ -661,13 +674,13 @@ def milestone_4(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PAT
     (by default) written to ``data/baseline.json`` so milestone 6 can reuse it::
 
         {
-          "label": "float32 (baseline)", "model_size_bytes": 324870,
-          "model_size_mb": 0.325, "n_parameters": 78208,
-          "n_train": 2250, "n_eval": 250, "n_eval_used": 250,
-          "top1_accuracy": 0.31, "top3_accuracy": 0.55, "mrr": 0.44,
-          "mean_nll": 2.85, "perplexity": 17.3, "mean_probability": 0.11,
-          "avg_inference_ms": 0.4,
-          "probing": {"k": 3, "n_itemsets": 10, "hit@k": 0.9, "mean_rank": 2.5},
+          "label": "float32 (baseline)", "model_size_bytes": ...,
+          "model_size_mb": ..., "n_parameters": ...,
+          "n_train": ..., "n_eval": ..., "n_eval_used": ...,
+          "top1_accuracy": ..., "top3_accuracy": ..., "mrr": ...,
+          "mean_nll": ..., "perplexity": ..., "mean_probability": ...,
+          "avg_inference_ms": ...,
+          "probing": {"k": 3, "n_itemsets": ..., "hit@k": ..., "mean_rank": ...},
         }
     """
     if dataset is None:
@@ -702,12 +715,12 @@ def milestone_4(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PAT
 # --- Milestone 5: Apply dynamic and static post-training quantization to the model
 # Hint: Implement the quantization steps from 'Shrink a Neural Network with Quantisation' to reduce model precision.
 
-DEFAULT_DYNAMIC_PATH = "data/model_dynamic.pt"
-DEFAULT_STATIC_PATH = "data/model_static.pt"
-DEFAULT_QUANTIZATION_PATH = "data/quantization.json"
+DEFAULT_DYNAMIC_PATH = str(DATA_DIR / "model_dynamic.pt")
+DEFAULT_STATIC_PATH = str(DATA_DIR / "model_static.pt")
+DEFAULT_QUANTIZATION_PATH = str(DATA_DIR / "quantization.json")
 
 STATIC_LIMITATION = (
-    "PyTorch 2.15 no longer ships FX graph mode (prepare_fx/convert_fx were removed), and eager "
+    "This PyTorch build does not ship FX graph mode (prepare_fx/convert_fx are unavailable), and eager "
     "mode cannot put softmax, matmul, LayerNorm or GELU on int8 because they have no quantized "
     "kernels. So every nn.Linear is quantized on its own between QuantStub and DeQuantStub "
     "(int8 weights and int8 activations, calibrated on training baskets); the attention math "
@@ -835,7 +848,7 @@ def _json_safe(result: dict) -> dict:
 
 def milestone_5(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PATH,
                 n_calibration: int = 128, max_eval: int | None = None,
-                out_dir: str = "data") -> dict:
+                out_dir: str = DEFAULT_DATA_DIR) -> dict:
     """Apply dynamic and static post-training quantization and measure both.
 
     Returns the baseline, the dynamic result and the static result. Each result carries
@@ -884,7 +897,7 @@ def milestone_5(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PAT
 # --- Milestone 6: Demonstrate size reduction and evaluate accuracy impact
 # Hint: Compare the size of the quantized model to the original and re-evaluate its accuracy using techniques from 'Shrink a Neural Network with Quantisation'.
 
-DEFAULT_COMPARISON_PATH = "data/comparison.json"
+DEFAULT_COMPARISON_PATH = str(DATA_DIR / "comparison.json")
 
 
 def _comparison_row(method: str, label: str, result: dict, baseline_size: int | None,
@@ -937,7 +950,7 @@ def _comparison_row(method: str, label: str, result: dict, baseline_size: int | 
 
 def milestone_6(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PATH,
                 n_calibration: int = 128, max_eval: int | None = None,
-                benchmark_repetitions: int = 100, out_dir: str = "data",
+                benchmark_repetitions: int = 100, out_dir: str = DEFAULT_DATA_DIR,
                 out_path: str | None = DEFAULT_COMPARISON_PATH) -> dict:
     """Compare float32, dynamic int8 and static int8 on the same held-out baskets.
 
@@ -947,13 +960,13 @@ def milestone_6(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PAT
 
         {
           "baseline_label": "Original (float32)",
-          "n_train": 2250, "n_eval": 250, "n_eval_used": 250,
+          "n_train": ..., "n_eval": ..., "n_eval_used": ...,
           "results": [
-            {"method": "original", "status": "ok", "model_size_bytes": 322444,
-             "size_reduction_percent": 0.0, "top1_accuracy": 0.384,
-             "top1_delta": 0.0, "avg_inference_ms": 0.32, "inference_speedup": 1.0, ...},
-            {"method": "dynamic", "status": "ok", "size_reduction_percent": 63.6, ...},
-            {"method": "static", "status": "ok", "size_reduction_percent": 55.1, ...},
+            {"method": "original", "status": "ok", "model_size_bytes": ...,
+             "size_reduction_percent": 0.0, "top1_accuracy": ...,
+             "top1_delta": 0.0, "avg_inference_ms": ..., "inference_speedup": 1.0, ...},
+            {"method": "dynamic", "status": "ok", "size_reduction_percent": ..., ...},
+            {"method": "static", "status": "ok", "size_reduction_percent": ..., ...},
           ],
           "summary": {"quantization_succeeded": ["dynamic", "static"],
                       "quantization_failed": [], "smallest_model": "dynamic",

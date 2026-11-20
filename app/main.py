@@ -41,13 +41,21 @@ def _model_from_disk():
 
 def _init_state():
     """Pick up existing files once, so a page rerun never retrains anything."""
-    if "dataset" not in st.session_state:
-        st.session_state.dataset = _dataset_from_disk()
-    if "trained" not in st.session_state:
-        st.session_state.trained = (None if st.session_state.get("model_stale")
-                                    else _model_from_disk())
-    for key in ("baseline", "quantized", "comparison", "recommendations"):
+    for key in ("baseline", "quantized", "comparison", "recommendations", "load_error"):
         st.session_state.setdefault(key, None)
+    if "dataset" not in st.session_state:
+        try:
+            st.session_state.dataset = _dataset_from_disk()
+        except Exception as error:
+            st.session_state.dataset = None
+            st.session_state.load_error = f"Could not read the saved dataset: {error}"
+    if "trained" not in st.session_state:
+        try:
+            st.session_state.trained = (None if st.session_state.get("model_stale")
+                                        else _model_from_disk())
+        except Exception as error:
+            st.session_state.trained = None
+            st.session_state.load_error = f"Could not read the saved model: {error}"
 
 
 def _inference_dataset(trained: dict) -> dict:
@@ -89,6 +97,8 @@ st.write(
     "shopping baskets. It recommends the next item for your basket, and post-training "
     "quantization shrinks it — with the size and accuracy impact measured, not assumed."
 )
+if st.session_state.get("load_error"):
+    st.warning(f"{st.session_state.load_error} Regenerate the dataset or retrain to replace it.")
 
 # ----------------------------------------------------------------------------------
 # Sidebar: data and training

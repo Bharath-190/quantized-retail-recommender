@@ -1,7 +1,4 @@
-"""Your tests. Each milestone in README.md gets one here: write the test first, then make it pass.
-
-They start skipped. Remove the `skip` line as you work on each milestone.
-"""
+"""Tests for the six milestones in README.md, one group per milestone."""
 import math
 from collections import Counter
 
