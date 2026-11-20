@@ -385,6 +385,99 @@ def test_milestone_5_sizes_and_saved_artifacts(quantized):
 
 
 # Milestone 6: Demonstrate size reduction and evaluate accuracy impact
-@pytest.mark.skip(reason="remove this line when you start milestone 6")
-def test_milestone_6():
-    raise NotImplementedError("write the test for milestone 6")
+@pytest.fixture(scope="module")
+def comparison(tmp_path_factory, trained, dataset):
+    path = tmp_path_factory.mktemp("comparison") / "comparison.json"
+    return core.milestone_6(dataset=dataset, model_path=trained["model_path"],
+                            n_calibration=16, max_eval=40, benchmark_repetitions=5,
+                            out_dir=str(tmp_path_factory.mktemp("artifacts")),
+                            out_path=str(path))
+
+
+def test_milestone_6_comparison_structure(comparison):
+    assert comparison["baseline_label"] == "Original (float32)"
+    assert [row["method"] for row in comparison["results"]] == ["original", "dynamic", "static"]
+    for row in comparison["results"]:
+        for key in ("method", "label", "status", "model_size_bytes", "model_size_mb",
+                    "size_reduction_bytes", "size_reduction_percent", "compression_ratio",
+                    "top1_accuracy", "top3_accuracy", "mrr", "mean_nll", "perplexity",
+                    "top1_delta", "top3_delta", "mrr_delta", "avg_inference_ms",
+                    "inference_speedup", "quantized_layers", "limitation", "error"):
+            assert key in row
+    assert comparison["results"][0]["status"] == "ok"
+    assert comparison["n_eval_used"] == 40
+    assert set(comparison["summary"]) == {"quantization_succeeded", "quantization_failed",
+                                          "smallest_model", "best_top1_accuracy"}
+
+
+def test_milestone_6_size_reduction_math(comparison):
+    original, dynamic, static = comparison["results"]
+    assert original["model_size_bytes"] > 0
+    assert original["size_reduction_bytes"] == 0
+    assert original["size_reduction_percent"] == 0.0
+    assert original["compression_ratio"] == 1.0
+
+    for row in (dynamic, static):
+        assert row["status"] == "ok"
+        assert row["model_size_bytes"] < original["model_size_bytes"]
+        assert row["size_reduction_bytes"] == original["model_size_bytes"] - row["model_size_bytes"]
+        assert row["size_reduction_percent"] == pytest.approx(
+            100.0 * row["size_reduction_bytes"] / original["model_size_bytes"])
+        assert row["compression_ratio"] == pytest.approx(
+            original["model_size_bytes"] / row["model_size_bytes"])
+        assert 0.0 < row["size_reduction_percent"] < 100.0
+        assert row["model_size_mb"] == pytest.approx(row["model_size_bytes"] / 1e6)
+
+
+def test_milestone_6_accuracy_and_latency_math(comparison):
+    original, dynamic, static = comparison["results"]
+    for name in ("top1_accuracy", "top3_accuracy", "mrr"):
+        assert original[name] is not None
+    assert original["top1_delta"] == 0.0 and original["mrr_delta"] == 0.0
+    assert original["inference_speedup"] == 1.0
+
+    for row in (dynamic, static):
+        assert 0.0 <= row["top1_accuracy"] <= 1.0
+        assert 0.0 <= row["top3_accuracy"] <= 1.0
+        assert 0.0 < row["mrr"] <= 1.0
+        assert row["top1_delta"] == pytest.approx(row["top1_accuracy"] - original["top1_accuracy"])
+        assert row["top3_delta"] == pytest.approx(row["top3_accuracy"] - original["top3_accuracy"])
+        assert row["mrr_delta"] == pytest.approx(row["mrr"] - original["mrr"])
+        assert row["avg_inference_ms"] > 0
+        assert row["inference_speedup"] == pytest.approx(
+            original["avg_inference_ms"] / row["avg_inference_ms"])
+    assert comparison["n_eval_used"] == 40
+
+
+def test_milestone_6_handles_unavailable_quantization(trained, dataset, tmp_path, monkeypatch):
+    def unavailable(*args, **kwargs):
+        return {"method": "static", "status": "failed", "model": None,
+                "model_size_bytes": None, "quantized_layers": 0, "int8_weights": 0,
+                "calibrated_on": 0, "limitation": "not supported in this build",
+                "error": "RuntimeError: quantization unsupported"}
+
+    monkeypatch.setattr(core, "quantize_static_model", unavailable)
+    result = core.milestone_6(dataset=dataset, model_path=trained["model_path"],
+                              n_calibration=8, max_eval=20, benchmark_repetitions=3,
+                              out_dir=str(tmp_path / "artifacts"),
+                              out_path=str(tmp_path / "comparison.json"))
+    static = result["results"][2]
+    assert static["method"] == "static" and static["status"] == "failed"
+    assert static["error"] == "RuntimeError: quantization unsupported"
+    for key in ("model_size_bytes", "size_reduction_bytes", "size_reduction_percent",
+                "compression_ratio", "top1_accuracy", "top1_delta", "avg_inference_ms",
+                "inference_speedup"):
+        assert static[key] is None                       # no invented numbers, no zero-division
+    assert result["summary"]["quantization_failed"] == ["static"]
+    assert result["summary"]["quantization_succeeded"] == ["dynamic"]
+    assert result["results"][1]["status"] == "ok"
+
+
+def test_milestone_6_writes_reusable_json(trained, dataset, tmp_path):
+    import json
+
+    out_path = tmp_path / "comparison.json"
+    result = core.milestone_6(dataset=dataset, model_path=trained["model_path"],
+                              n_calibration=8, max_eval=10, benchmark_repetitions=2,
+                              out_dir=str(tmp_path / "artifacts"), out_path=str(out_path))
+    assert json.loads(out_path.read_text()) == result       # the UI can read it back as is

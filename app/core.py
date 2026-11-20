@@ -883,5 +883,126 @@ def milestone_5(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PAT
 
 # --- Milestone 6: Demonstrate size reduction and evaluate accuracy impact
 # Hint: Compare the size of the quantized model to the original and re-evaluate its accuracy using techniques from 'Shrink a Neural Network with Quantisation'.
-def milestone_6():  # TODO(milestone 6)
-    raise NotImplementedError("TODO(milestone 6)")
+
+DEFAULT_COMPARISON_PATH = "data/comparison.json"
+
+
+def _comparison_row(method: str, label: str, result: dict, baseline_size: int | None,
+                    baseline_metrics: dict | None, baseline_ms: float | None) -> dict:
+    """One UI-friendly row: measurements plus their difference from the baseline.
+
+    Anything that could not be measured stays ``None``; a failed variant therefore never
+    looks better (or worse) than it is, and no division ever runs on a missing number.
+    """
+    size = result.get("model_size_bytes")
+    metrics = result.get("metrics") or None
+    latency = result.get("avg_inference_ms")
+    row = {
+        "method": method,
+        "label": label,
+        "status": result.get("status", "ok"),
+        "model_size_bytes": size,
+        "model_size_mb": None if size is None else size / 1e6,
+        "size_reduction_bytes": None,
+        "size_reduction_percent": None,
+        "compression_ratio": None,
+        "top1_accuracy": None,
+        "top3_accuracy": None,
+        "mrr": None,
+        "mean_nll": None,
+        "perplexity": None,
+        "top1_delta": None,
+        "top3_delta": None,
+        "mrr_delta": None,
+        "avg_inference_ms": latency,
+        "inference_speedup": None,
+        "quantized_layers": result.get("quantized_layers"),
+        "limitation": result.get("limitation"),
+        "error": result.get("error"),
+    }
+    if size is not None and baseline_size:
+        row["size_reduction_bytes"] = baseline_size - size
+        row["size_reduction_percent"] = 100.0 * (baseline_size - size) / baseline_size
+        row["compression_ratio"] = baseline_size / size
+    if metrics:
+        for key in ("top1_accuracy", "top3_accuracy", "mrr", "mean_nll", "perplexity"):
+            row[key] = metrics.get(key)
+        for key in ("top1_accuracy", "top3_accuracy", "mrr"):
+            if row[key] is not None and baseline_metrics and baseline_metrics.get(key) is not None:
+                row[f"{key.replace('_accuracy', '')}_delta"] = row[key] - baseline_metrics[key]
+    if latency and baseline_ms and latency > 0:
+        row["inference_speedup"] = baseline_ms / latency
+    return row
+
+
+def milestone_6(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PATH,
+                n_calibration: int = 128, max_eval: int | None = None,
+                benchmark_repetitions: int = 100, out_dir: str = "data",
+                out_path: str | None = DEFAULT_COMPARISON_PATH) -> dict:
+    """Compare float32, dynamic int8 and static int8 on the same held-out baskets.
+
+    Sizes and accuracies come from milestone 5 (same ``evaluate_model`` in both cases);
+    latency is measured here for every variant that actually exists. The returned dict is
+    JSON-safe and written to ``data/comparison.json`` for the UI::
+
+        {
+          "baseline_label": "Original (float32)",
+          "n_train": 2250, "n_eval": 250, "n_eval_used": 250,
+          "results": [
+            {"method": "original", "status": "ok", "model_size_bytes": 322444,
+             "size_reduction_percent": 0.0, "top1_accuracy": 0.384,
+             "top1_delta": 0.0, "avg_inference_ms": 0.32, "inference_speedup": 1.0, ...},
+            {"method": "dynamic", "status": "ok", "size_reduction_percent": 63.6, ...},
+            {"method": "static", "status": "ok", "size_reduction_percent": 55.1, ...},
+          ],
+          "summary": {"quantization_succeeded": ["dynamic", "static"],
+                      "quantization_failed": [], "smallest_model": "dynamic",
+                      "best_top1_accuracy": "original"},
+        }
+    """
+    if dataset is None:
+        dataset = load_dataset() if Path(DEFAULT_DATASET_PATH).exists() else milestone_1()
+    quantized = milestone_5(dataset=dataset, model_path=model_path,
+                            n_calibration=n_calibration, max_eval=max_eval, out_dir=out_dir)
+
+    baseline = dict(quantized["baseline"])
+    baseline_model, _ = load_model(model_path)
+    baseline["avg_inference_ms"] = 1000.0 * benchmark_inference(
+        baseline_model, dataset, repetitions=benchmark_repetitions)
+    baseline_size = baseline["model_size_bytes"]
+    baseline_metrics = baseline["metrics"]
+    baseline_ms = baseline["avg_inference_ms"]
+
+    rows = [_comparison_row("original", "Original (float32)", baseline,
+                            baseline_size, baseline_metrics, baseline_ms)]
+    for method, label in (("dynamic", "Dynamic int8"), ("static", "Static int8")):
+        result = dict(quantized[method])
+        if result.get("status") == "ok" and result.get("model") is not None:
+            result["avg_inference_ms"] = 1000.0 * benchmark_inference(
+                result["model"], dataset, repetitions=benchmark_repetitions)
+        rows.append(_comparison_row(method, label, result, baseline_size,
+                                    baseline_metrics, baseline_ms))
+
+    available = [row for row in rows if row["status"] == "ok"]
+    comparison = {
+        "baseline_label": "Original (float32)",
+        "n_train": len(dataset["train"]),
+        "n_eval": len(dataset["eval"]),
+        "n_eval_used": baseline_metrics.get("n_eval_used"),
+        "benchmark_repetitions": benchmark_repetitions,
+        "results": rows,
+        "summary": {
+            "quantization_succeeded": [row["method"] for row in rows[1:]
+                                       if row["status"] == "ok"],
+            "quantization_failed": [row["method"] for row in rows[1:]
+                                    if row["status"] != "ok"],
+            "smallest_model": min(available, key=lambda row: row["model_size_bytes"])["method"],
+            "best_top1_accuracy": max(available,
+                                      key=lambda row: row["top1_accuracy"] or 0.0)["method"],
+        },
+    }
+    if out_path:
+        path = Path(out_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(comparison, indent=2))
+    return comparison
