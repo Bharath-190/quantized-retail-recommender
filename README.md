@@ -14,17 +14,17 @@ This project develops a smart retail recommender using a language model trained 
 
 Tick these off as you go, and commit after each one.
 
-- [ ] **1. Prepare synthetic shopping basket data for training**  
+- [x] **1. Prepare synthetic shopping basket data for training**  
       Hint: Use the data preparation techniques from 'Teach a Language Model What Sells Together' to format your shopping basket sequences.
-- [ ] **2. Continue pretraining a small LM on the basket data**  
+- [x] **2. Continue pretraining a small LM on the basket data**  
       Hint: Apply the fine-tuning methods from 'Teach a Language Model What Sells Together' to adapt your model.
-- [ ] **3. Implement next-item prediction and itemset probing**  
+- [x] **3. Implement next-item prediction and itemset probing**  
       Hint: Use the inference and analysis patterns from 'Teach a Language Model What Sells Together' to generate recommendations.
-- [ ] **4. Measure the baseline size and accuracy of the model**  
+- [x] **4. Measure the baseline size and accuracy of the model**  
       Hint: Before quantization, record the model's original size and evaluate its performance metrics.
-- [ ] **5. Apply dynamic and static post-training quantization to the model**  
+- [x] **5. Apply dynamic and static post-training quantization to the model**  
       Hint: Implement the quantization steps from 'Shrink a Neural Network with Quantisation' to reduce model precision.
-- [ ] **6. Demonstrate size reduction and evaluate accuracy impact**  
+- [x] **6. Demonstrate size reduction and evaluate accuracy impact**  
       Hint: Compare the size of the quantized model to the original and re-evaluate its accuracy using techniques from 'Shrink a Neural Network with Quantisation'.
 
 ## Run it
@@ -34,13 +34,23 @@ You need Python 3.12 and git.
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # then choose a model; see the comments inside
+cp .env.example .env        # optional: only app/llm.py reads it; the recommender does not need it
 streamlit run app/main.py
 pytest
 ```
 
-Your work goes in `app/core.py` (one stub per milestone) and `tests/test_core.py`. The first tests pass already; they
-check the plumbing.
+The six milestone implementations live in `app/core.py` and their tests in `tests/test_core.py`.
+
+### Using the demo
+
+In the sidebar, **Generate dataset**, then **Train model + measure baseline**. Then pick a basket and press
+**Recommend next items**, press **Quantize models**, and press **Compare all models** to see the size and accuracy
+table and charts. Every number comes from the matching milestone function on the current data and model; page
+reruns reuse the trained model instead of retraining.
+
+`data/dataset.json`, `data/model.pt`, `data/model_dynamic.pt`, `data/model_static.pt`, `data/baseline.json`,
+`data/quantization.json` and `data/comparison.json` are generated artifacts and are ignored by git. Replacing the
+dataset disables the old model in the UI until you train again.
 
 ## Settings and secrets
 
