@@ -1,7 +1,8 @@
 streamlit>=1.49
 httpx
 pytest
-thilimarketbasket @ git+https://github.com/thili-ai/thilimarketbasket.git
 numpy
 pandas
-torch
+# Pinned: this project uses torch.ao.quantization eager mode (deprecated upstream), so it
+# stays on the version it was verified with: 2.15.0, CPU-only wheels are fine.
+torch==2.15.0

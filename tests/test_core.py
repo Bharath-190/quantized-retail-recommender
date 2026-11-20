@@ -63,6 +63,28 @@ def test_milestone_1_is_reproducible_and_reusable(tmp_path):
     assert core.load_dataset(str(path)) == first            # later milestones can reuse the file
 
 
+def test_milestone_1_is_reproducible_across_processes(tmp_path):
+    """The same seed must give byte-identical data even when PYTHONHASHSEED differs.
+
+    Python set iteration order changes with hash randomisation, so a generator that keeps
+    its items in a set leaks that order into the RNG and into the saved file.
+    """
+    import os
+    import subprocess
+    import sys
+
+    script = ("import sys; from app import core; "
+              "core.milestone_1(n_baskets=300, seed=5, out_path=sys.argv[1])")
+    outputs = []
+    for hash_seed in ("0", "987654"):
+        path = tmp_path / f"dataset_{hash_seed}.json"
+        environment = {**os.environ, "PYTHONHASHSEED": hash_seed}
+        subprocess.run([sys.executable, "-c", script, str(path)], check=True,
+                       cwd=core.PROJECT_ROOT, env=environment, capture_output=True)
+        outputs.append(path.read_text())
+    assert outputs[0] == outputs[1]
+
+
 def test_milestone_1_has_co_purchase_patterns(dataset):
     baskets = [set(core.decode_sequence(dataset, tokens)) for tokens in dataset["train"]]
     counts = Counter(name for basket in baskets for name in basket)

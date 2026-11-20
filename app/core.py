@@ -114,16 +114,23 @@ def _popularity(products: list[str]) -> np.ndarray:
 
 
 def _make_basket(rng, products, shares, item2id, position) -> list[int]:
-    """One basket of product ids, in a random order (a basket is a set, not a list)."""
+    """One basket of product ids, in a random order (a basket is a set, not a list).
+
+    ``chosen`` is an insertion-ordered dict, not a set: Python set iteration order depends
+    on ``PYTHONHASHSEED``, which would make the same seed produce different files in
+    different processes. The final shuffle still randomises the order seen by the model.
+    """
     size = int(np.clip(rng.poisson(5.0) + 2, 2, MAX_BASKET_ITEMS))
-    chosen: set[str] = set()
+    chosen: dict[str, None] = {}
     if rng.random() < THEME_PROB:
         theme = THEMES[int(rng.integers(len(THEMES)))]  # pick a shopping errand
-        chosen.update(theme[:2])                        # ...and take its anchors
+        for name in theme[:2]:                          # ...and take its anchors
+            chosen[name] = None
         extras = list(theme[2:])
         take = min(len(extras), max(0, size - len(chosen)))
         if take:
-            chosen.update(str(name) for name in rng.choice(extras, size=take, replace=False))
+            for name in rng.choice(extras, size=take, replace=False):
+                chosen[str(name)] = None
     available = np.ones(len(products), dtype=bool)
     for name in chosen:
         available[position[name]] = False
@@ -131,7 +138,7 @@ def _make_basket(rng, products, shares, item2id, position) -> list[int]:
         weights = shares * available
         weights = weights / weights.sum()
         index = int(rng.choice(len(products), p=weights))
-        chosen.add(products[index])
+        chosen[products[index]] = None
         available[index] = False
     order = list(chosen)
     rng.shuffle(order)
@@ -427,8 +434,10 @@ def milestone_2(dataset: dict | None = None, epochs: int = 20, batch_size: int =
     """Train the tiny causal LM on the milestone 1 basket sequences.
 
     The objective is ordinary next-token prediction, so the model is a real language
-    model over the product vocabulary. The checkpoint (weights, vocabulary and model
-    config) is written to ``out_path`` and the returned dict is JSON-safe metadata::
+    model over the product vocabulary. It is trained from scratch rather than continued
+    from a pretrained checkpoint; README.md has a "Note on Milestone 2" explaining that
+    deviation. The checkpoint (weights, vocabulary and model config) is written to
+    ``out_path`` and the returned dict is JSON-safe metadata::
 
         {
           "model_path": ..., "config": {"vocab_size": ..., "d_model": ...},

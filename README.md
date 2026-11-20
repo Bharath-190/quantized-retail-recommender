@@ -29,10 +29,10 @@ Tick these off as you go, and commit after each one.
 
 ## Run it
 
-You need Python 3.12 and git.
+You need Python 3.11 or newer (verified locally on 3.11; CI targets 3.12). No git install is required.
 
 ```bash
-python3.12 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env        # optional: only app/llm.py reads it; the recommender does not need it
 streamlit run app/main.py
@@ -40,6 +40,8 @@ pytest
 ```
 
 The six milestone implementations live in `app/core.py` and their tests in `tests/test_core.py`.
+Dataset generation and training are seeded: the same seed and parameters produce the same
+`data/dataset.json` and `data/model.pt`, including in separate processes.
 
 ### Using the demo
 
@@ -51,6 +53,15 @@ reruns reuse the trained model instead of retraining.
 `data/dataset.json`, `data/model.pt`, `data/model_dynamic.pt`, `data/model_static.pt`, `data/baseline.json`,
 `data/quantization.json` and `data/comparison.json` are generated artifacts and are ignored by git. Replacing the
 dataset disables the old model in the UI until you train again.
+
+## Note on Milestone 2
+
+The milestone hint points at the continued-pretraining lesson from 'Teach a Language Model What Sells
+Together', whose reference implementation fine-tunes SmolLM2-135M (and is MLX/Apple-only there).
+This project pins no external checkpoint: the brief asks for a tiny model that trains quickly on a
+CPU without downloads. `milestone_2` therefore trains the small causal Transformer **from scratch**
+on the basket corpus with the same next-token objective. It is a genuine autoregressive language
+model, but it is not continued pretraining of a pretrained checkpoint.
 
 ## Settings and secrets
 
