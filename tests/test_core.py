@@ -2,6 +2,7 @@
 
 They start skipped. Remove the `skip` line as you work on each milestone.
 """
+import math
 from collections import Counter
 
 import pytest
@@ -241,9 +242,58 @@ def test_milestone_3_is_deterministic(trained, dataset):
 
 
 # Milestone 4: Measure the baseline size and accuracy of the model
-@pytest.mark.skip(reason="remove this line when you start milestone 4")
-def test_milestone_4():
-    raise NotImplementedError("write the test for milestone 4")
+@pytest.fixture(scope="module")
+def baseline(tmp_path_factory, trained, dataset):
+    path = tmp_path_factory.mktemp("baseline") / "baseline.json"
+    return core.milestone_4(dataset=dataset, model_path=trained["model_path"],
+                            max_eval=40, benchmark_repetitions=10, out_path=str(path))
+
+
+def test_milestone_4_reports_baseline_metrics(baseline):
+    assert baseline["label"] == "float32 (baseline)"
+    assert baseline["n_parameters"] == 78_208
+    assert baseline["n_train"] == 540 and baseline["n_eval"] == 60
+    assert baseline["n_eval_used"] == 40                     # max_eval capped it
+
+    assert baseline["model_size_bytes"] > 0
+    assert baseline["model_size_mb"] == pytest.approx(baseline["model_size_bytes"] / 1e6)
+
+    for name in ("top1_accuracy", "top3_accuracy", "mrr", "mean_probability", "avg_inference_ms"):
+        assert isinstance(baseline[name], float)
+        assert math.isfinite(baseline[name])
+    assert 0.0 <= baseline["top1_accuracy"] <= 1.0
+    assert 0.0 <= baseline["top3_accuracy"] <= 1.0
+    assert 0.0 < baseline["mrr"] <= 1.0
+    assert baseline["top1_accuracy"] <= baseline["top3_accuracy"] <= 1.0
+    assert 0.0 < baseline["mean_probability"] < 1.0
+    assert baseline["avg_inference_ms"] > 0.0
+    assert baseline["mean_nll"] > 0.0 and baseline["perplexity"] > 1.0
+
+    probing = baseline["probing"]
+    assert probing["n_itemsets"] == 10
+    assert 0.0 <= probing["hit@k"] <= 1.0
+    assert 1.0 <= probing["mean_rank"] <= 76              # one rank per catalogue product
+
+
+def test_milestone_4_evaluates_held_out_data_deterministically(trained, dataset, tmp_path):
+    path = tmp_path / "baseline.json"
+    first = core.milestone_4(dataset=dataset, model_path=trained["model_path"],
+                             max_eval=20, benchmark_repetitions=5, out_path=str(path))
+    second = core.milestone_4(dataset=dataset, model_path=trained["model_path"],
+                              max_eval=20, benchmark_repetitions=5, out_path=None)
+    for key in ("top1_accuracy", "top3_accuracy", "mrr", "mean_nll", "perplexity",
+                "model_size_bytes", "n_eval_used"):
+        assert first[key] == second[key]                    # no sampling, no dropout
+
+    import json
+    assert json.loads(path.read_text()) == first             # reusable by milestone 6
+
+    # Different data must give different numbers: the evaluation really reads the split.
+    smaller = {**dataset, "eval": dataset["train"][:20]}
+    other = core.milestone_4(dataset=smaller, model_path=trained["model_path"],
+                             max_eval=20, benchmark_repetitions=5, out_path=None)
+    assert other["n_train"] == len(dataset["train"])
+    assert other["top1_accuracy"] != first["top1_accuracy"] or other["mean_nll"] != first["mean_nll"]
 
 
 # Milestone 5: Apply dynamic and static post-training quantization to the model

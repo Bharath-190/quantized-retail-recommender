@@ -1,6 +1,8 @@
 """Your code. One stub per milestone; build them in order and keep each one small."""
+import io
 import json
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -570,8 +572,128 @@ def milestone_3(basket: list[str] | None = None, k: int = 5,
 
 # --- Milestone 4: Measure the baseline size and accuracy of the model
 # Hint: Before quantization, record the model's original size and evaluate its performance metrics.
-def milestone_4():  # TODO(milestone 4)
-    raise NotImplementedError("TODO(milestone 4)")
+
+DEFAULT_BASELINE_PATH = "data/baseline.json"
+
+
+def model_size_bytes(model: nn.Module) -> int:
+    """The bytes the model's weights really take when written to disk.
+
+    Saving the state dict to memory instead of the file system keeps the measurement
+    repeatable and gives every variant (float32, dynamic int8, static int8) the same
+    fair measurement in milestones 4 and 6.
+    """
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    return len(buffer.getvalue())
+
+
+def evaluate_model(model: TinyCausalLM, dataset: dict,
+                   max_examples: int | None = None) -> dict:
+    """Next-item accuracy on the held-out baskets; the same procedure every variant uses.
+
+    Each evaluation basket hides its last product: the model sees the basket without it
+    and we rank the hidden product among the products not already in the basket. Top-1,
+    top-3, MRR, mean negative log-likelihood and perplexity are computed from those ranks
+    and probabilities. Nothing is sampled, so the numbers are deterministic.
+    """
+    sequences = dataset["eval"] if max_examples is None else dataset["eval"][:max_examples]
+    vocab_size = len(dataset["vocab"])
+    ranks, probabilities, losses = [], [], []
+    for tokens in sequences:
+        if len(tokens) < 4:                        # <bos> + one product + <eos> is nothing to predict
+            continue
+        prefix, target = tokens[:-2], tokens[-2]    # drop the <eos>, then hide the last product
+        with torch.no_grad():
+            logits = model(torch.tensor([prefix]))[0, -1]
+        log_probabilities = torch.log_softmax(logits, dim=-1)
+        losses.append(-float(log_probabilities[target]))
+        probabilities.append(float(log_probabilities[target].exp()))
+        visible = set(prefix)
+        better = sum(1 for token in range(PRODUCT_OFFSET, vocab_size)
+                     if token not in visible and token != target
+                     and float(logits[token]) >= float(logits[target]))
+        ranks.append(1 + better)
+    n = len(ranks)
+    if n == 0:
+        raise ValueError("no evaluation baskets to score")
+    mean_nll = sum(losses) / n
+    return {
+        "n_eval_used": n,
+        "top1_accuracy": sum(rank == 1 for rank in ranks) / n,
+        "top3_accuracy": sum(rank <= 3 for rank in ranks) / n,
+        "mrr": sum(1.0 / rank for rank in ranks) / n,
+        "mean_nll": mean_nll,
+        "perplexity": math.exp(mean_nll),
+        "mean_probability": sum(probabilities) / n,
+    }
+
+
+def benchmark_inference(model: TinyCausalLM, dataset: dict,
+                        repetitions: int = 100) -> float:
+    """Mean seconds for one basket's next-item prediction, batch size one, on CPU."""
+    if repetitions < 1:
+        raise ValueError("repetitions must be at least 1")
+    prefixes = [tokens[:-2] for tokens in dataset["eval"] if len(tokens) >= 4]
+    if not prefixes:
+        raise ValueError("no evaluation baskets to benchmark")
+    model.eval()
+    with torch.no_grad():
+        for _ in range(3):                          # warm-up, not measured
+            model(torch.tensor([prefixes[0]]))
+        start = time.perf_counter()
+        for step in range(repetitions):
+            model(torch.tensor([prefixes[step % len(prefixes)]]))
+        elapsed = time.perf_counter() - start
+    return elapsed / repetitions
+
+
+def milestone_4(dataset: dict | None = None, model_path: str = DEFAULT_MODEL_PATH,
+                max_eval: int | None = None, benchmark_repetitions: int = 100,
+                probe_k: int = 3, out_path: str | None = DEFAULT_BASELINE_PATH) -> dict:
+    """Baseline size, accuracy and latency of the unquantized model.
+
+    Everything is measured on the held-out evaluation baskets with the same functions the
+    quantized models will use in milestones 5 and 6. The JSON-safe result is returned and
+    (by default) written to ``data/baseline.json`` so milestone 6 can reuse it::
+
+        {
+          "label": "float32 (baseline)", "model_size_bytes": 324870,
+          "model_size_mb": 0.325, "n_parameters": 78208,
+          "n_train": 2250, "n_eval": 250, "n_eval_used": 250,
+          "top1_accuracy": 0.31, "top3_accuracy": 0.55, "mrr": 0.44,
+          "mean_nll": 2.85, "perplexity": 17.3, "mean_probability": 0.11,
+          "avg_inference_ms": 0.4,
+          "probing": {"k": 3, "n_itemsets": 10, "hit@k": 0.9, "mean_rank": 2.5},
+        }
+    """
+    if dataset is None:
+        dataset = load_dataset() if Path(DEFAULT_DATASET_PATH).exists() else milestone_1()
+    if not Path(model_path).exists():
+        milestone_2(dataset=dataset, out_path=model_path)
+    model, _ = load_model(model_path)
+
+    size = model_size_bytes(model)
+    probing = probe_itemsets(model, dataset, k=probe_k)
+    results = {
+        "label": "float32 (baseline)",
+        "model_path": str(model_path),
+        "model_size_bytes": size,
+        "model_size_mb": size / 1e6,
+        "n_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "n_train": len(dataset["train"]),
+        "n_eval": len(dataset["eval"]),
+        **evaluate_model(model, dataset, max_examples=max_eval),
+        "avg_inference_ms": 1000.0 * benchmark_inference(model, dataset,
+                                                         repetitions=benchmark_repetitions),
+        "probing": {"k": probe_k, "n_itemsets": probing["n_itemsets"],
+                    "hit@k": probing["hit@k"], "mean_rank": probing["mean_rank"]},
+    }
+    if out_path:
+        path = Path(out_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(results, indent=2))
+    return results
 
 
 # --- Milestone 5: Apply dynamic and static post-training quantization to the model
